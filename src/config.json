@@ -1,0 +1,1 @@
+{"data_dir": "", "output_dir": "", "model_path": "", "negative_pairs": "1000", "epochs": "10", "batch_size": "32", "learning_rate": "0.001", "use_gpu": "False", "embedding_size": "128", "resize_size": "224", "auto_train_models": "1", "auto_train_iterations": "1"}
