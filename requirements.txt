@@ -1,0 +1,11 @@
+torch
+torchvision
+Pillow
+numpy
+pandas
+scikit-learn
+tqdm
+PyQt5
+opencv-python
+efficientnet-pytorch
+matplotlib
