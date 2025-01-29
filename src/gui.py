@@ -1,11 +1,13 @@
+
 import json
 import os
 from PyQt5.QtWidgets import (QWidget, QPushButton, QLabel,
                              QFileDialog, QLineEdit, QVBoxLayout, QHBoxLayout,
-                             QTextEdit, QProgressBar, QComboBox, QMessageBox)
-from PyQt5.QtCore import QThread, pyqtSignal
-from src.utils import (create_dataset_csv, FaceCompareModel, load_image,
-                       contrastive_loss, save_model, load_model, copy_model)
+                             QTextEdit, QProgressBar, QComboBox, QMessageBox, QSizePolicy)
+from PyQt5.QtCore import QThread, pyqtSignal, Qt
+from PyQt5.QtGui import QPixmap, QImage
+from src.utils import (create_dataset_csv, FaceCompareModel, CustomModel, load_image,
+                       contrastive_loss, save_model, load_model, copy_model, import_model)
 import torch
 from torchvision import transforms
 from torch.optim import Adam
@@ -13,7 +15,8 @@ from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-
+import io
+import numpy as np
 
 
 class TrainingWorker(QThread):
@@ -22,44 +25,37 @@ class TrainingWorker(QThread):
     plot_signal = pyqtSignal(str)
     finished_signal = pyqtSignal(str)
 
-    def __init__(self, data_dir, output_dir, csv_path, epochs, batch_size, learning_rate, use_gpu, model_path,
-                 embedding_size, resize_size, auto_train_models, auto_train_iterations):
+    def __init__(self, params, csv_path):
         super().__init__()
-        self.data_dir = data_dir
-        self.output_dir = output_dir
+        self.params = params
         self.csv_path = csv_path
-        self.epochs = epochs
-        self.batch_size = batch_size
-        self.learning_rate = learning_rate
-        self.use_gpu = use_gpu
-        self.model_path = model_path
         self.stop_training = False
-        self.embedding_size = embedding_size
-        self.resize_size = resize_size
-        self.auto_train_models = auto_train_models
-        self.auto_train_iterations = auto_train_iterations
+        self.device = torch.device("cuda" if torch.cuda.is_available() and self.params['use_gpu'] else "cpu")
+        self.transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+
+    def _create_model(self):
+        try:
+            model_class = self.params['model_type']
+            return model_class(self.params['embedding_size']).to(self.device)
+        except Exception as e:
+            raise ValueError(f"Не удалось создать модель: {e}")
 
     def stop(self):
         self.stop_training = True
 
     def run(self):
-        self.log_signal.emit("Starting training...")
-        if self.auto_train_models > 1 and self.auto_train_iterations > 1:
-            self.auto_train()
+        self.log_signal.emit(f"Начинаем обучение... Используем устройство: {self.device}")
+        if self.params['auto_train_models'] > 1 and self.params['auto_train_iterations'] > 1:
+            self._auto_train()
         else:
-            self.train()
+            self._train()
 
-    def auto_train(self):
-        device = torch.device("cuda" if torch.cuda.is_available() and self.use_gpu else "cpu")
-        self.log_signal.emit(f"Using device: {device}")
-
-        transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-
+    def _create_dataloader(self):
         class FaceDataset(Dataset):
-            def __init__(self, csv_path, transform=transform, resize_size=self.resize_size):
+            def __init__(self, csv_path, transform, resize_size):
                 self.df = pd.read_csv(csv_path)
                 self.transform = transform
                 self.resize_size = resize_size
@@ -72,160 +68,124 @@ class TrainingWorker(QThread):
                 img1_path = row['image1']
                 img2_path = row['image2']
                 label = torch.tensor(row['label'], dtype=torch.float32)
+                img1 = load_image(img1_path, self.transform, self.params['resize_size'])
+                img2 = load_image(img2_path, self.transform, self.params['resize_size'])
+                return (img1, img2, label) if img1 is not None and img2 is not None else None
 
-                img1 = load_image(img1_path, self.transform, self.resize_size)
-                img2 = load_image(img2_path, self.transform, self.resize_size)
-
-                if img1 is None or img2 is None:
-                    return None
-
-                return img1, img2, label
-
-        dataset = FaceDataset(self.csv_path)
+        dataset = FaceDataset(self.csv_path, self.transform, self.params['resize_size'])
         dataset = [item for item in dataset if item is not None]
-        dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+        return DataLoader(dataset, batch_size=self.params['batch_size'], shuffle=True)
+
+    def _train_epoch(self, model, optimizer, dataloader):
+        model.train()
+        total_loss = 0
+        for i, (img1_batch, img2_batch, label_batch) in enumerate(tqdm(dataloader)):
+            optimizer.zero_grad()
+            img1_batch = img1_batch.to(self.device)
+            img2_batch = img2_batch.to(self.device)
+            output1 = model(img1_batch)
+            output2 = model(img2_batch)
+            loss = contrastive_loss(output1, output2, label_batch.to(self.device))
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            self.progress_signal.emit(int((i + 1) / len(dataloader) * 100))
+        return total_loss / len(dataloader)
+
+    def _auto_train_epoch(self, model, optimizer, dataloader, model_idx, models_count):
+        model.train()
+        total_loss = 0
+        for i, (img1_batch, img2_batch, label_batch) in enumerate(tqdm(dataloader)):
+            optimizer.zero_grad()
+            img1_batch = img1_batch.to(self.device)
+            img2_batch = img2_batch.to(self.device)
+            output1 = model(img1_batch)
+            output2 = model(img2_batch)
+            loss = contrastive_loss(output1, output2, label_batch.to(self.device))
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            self.progress_signal.emit(
+                int((i + 1) / len(dataloader) * 100) // models_count + model_idx * (100 // models_count))
+        return total_loss / len(dataloader)
+
+    def _auto_train(self):
+        dataloader = self._create_dataloader()
         best_model = None
         best_loss = float('inf')
+        losses = []
 
-        for iteration in range(self.auto_train_iterations):
-            self.log_signal.emit(f"Auto-train iteration: {iteration + 1}/{self.auto_train_iterations}")
-            models = [FaceCompareModel(self.embedding_size).to(device) for _ in range(self.auto_train_models)]
-            optimizers = [Adam(model.parameters(), lr=self.learning_rate) for model in models]
+        for iteration in range(self.params['auto_train_iterations']):
+            self.log_signal.emit(f"Авто-обучение итерация: {iteration + 1}/{self.params['auto_train_iterations']}")
 
-            losses = []
+            models = [self._create_model() for _ in range(self.params['auto_train_models'])]
+            optimizers = [Adam(model.parameters(), lr=self.params['learning_rate']) for model in models]
+            iter_losses = []
 
             for model_idx, model in enumerate(models):
-                self.log_signal.emit(f"Training model {model_idx + 1}/{len(models)} in iteration {iteration + 1}...")
+                self.log_signal.emit(f"Обучение модели {model_idx + 1}/{len(models)} в итерации {iteration + 1}...")
                 model_losses = []
-                for epoch in range(self.epochs):
+                for epoch in range(self.params['epochs']):
                     if self.stop_training:
-                        self.log_signal.emit("Auto-training stopped by user.")
+                        self.log_signal.emit("Авто-обучение остановлено пользователем.")
                         return
-
-                    model.train()
-                    total_loss = 0
-                    for i, (img1_batch, img2_batch, label_batch) in enumerate(tqdm(dataloader)):
-                        optimizers[model_idx].zero_grad()
-                        img1_batch = img1_batch.to(device)
-                        img2_batch = img2_batch.to(device)
-
-                        output1 = model(img1_batch)
-                        output2 = model(img2_batch)
-
-                        loss = contrastive_loss(output1, output2, label_batch.to(device))
-                        loss.backward()
-                        optimizers[model_idx].step()
-                        total_loss += loss.item()
-                        self.progress_signal.emit(
-                            int((i + 1) / len(dataloader) * 100) // len(models) + model_idx * (100 // len(models)))
-                    avg_loss = total_loss / len(dataloader)
+                    avg_loss = self._auto_train_epoch(model, optimizers[model_idx], dataloader, model_idx, len(models))
                     model_losses.append(avg_loss)
-                    self.log_signal.emit(f"Epoch {epoch + 1}/{self.epochs}, Loss: {avg_loss:.4f} model {model_idx + 1}")
+                    self.log_signal.emit(
+                        f"Эпоха {epoch + 1}/{self.params['epochs']}, Loss: {avg_loss:.4f} модель {model_idx + 1}")
+                iter_losses.append(model_losses)
+            losses.append(iter_losses)
 
-                losses.append(model_losses)
-
-            avg_losses = [sum(model_losses) / len(model_losses) for model_losses in losses]
+            avg_losses = [sum(model_losses) / len(model_losses) for model_losses in iter_losses]
             min_loss_idx = avg_losses.index(min(avg_losses))
             if best_model is None or avg_losses[min_loss_idx] < best_loss:
                 best_model = copy_model(models[min_loss_idx])
                 best_loss = avg_losses[min_loss_idx]
-                self.log_signal.emit(f"Iteration {iteration + 1}: New best model found with avg loss: {best_loss:.4f}")
+                self.log_signal.emit(
+                    f"Итерация {iteration + 1}: Найдена новая лучшая модель со средним loss: {best_loss:.4f}")
             else:
-                self.log_signal.emit(f"Iteration {iteration + 1}: No improvement, using best model")
+                self.log_signal.emit(f"Итерация {iteration + 1}: Нет улучшений, используем лучшую модель")
 
-        plot_path = os.path.join(self.output_dir, 'training_loss.png')
-        self.plot_losses(losses, plot_path)
+        plot_path = os.path.join(self.params['output_dir'], 'training_loss.png')
+        self._plot_losses(losses, plot_path)
         self.plot_signal.emit(plot_path)
+        save_model(best_model, self.params['model_path'])
+        self.log_signal.emit(f"Авто-обучение завершено. Лучшая модель сохранена в: {self.params['model_path']}")
+        self.finished_signal.emit("Авто-обучение завершено!")
 
-        save_model(best_model, self.model_path)
-        self.log_signal.emit(f"Auto-training finished. Best model saved to: {self.model_path}")
-        self.finished_signal.emit("Auto-training completed!")
-
-    def train(self):
-        device = torch.device("cuda" if torch.cuda.is_available() and self.use_gpu else "cpu")
-        self.log_signal.emit(f"Using device: {device}")
-
-        transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-
-        class FaceDataset(Dataset):
-            def __init__(self, csv_path, transform=transform, resize_size=self.resize_size):
-                self.df = pd.read_csv(csv_path)
-                self.transform = transform
-                self.resize_size = resize_size
-
-            def __len__(self):
-                return len(self.df)
-
-            def __getitem__(self, idx):
-                row = self.df.iloc[idx]
-                img1_path = row['image1']
-                img2_path = row['image2']
-                label = torch.tensor(row['label'], dtype=torch.float32)
-
-                img1 = load_image(img1_path, self.transform, self.resize_size)
-                img2 = load_image(img2_path, self.transform, self.resize_size)
-
-                if img1 is None or img2 is None:
-                    return None
-
-                return img1, img2, label
-
-        dataset = FaceDataset(self.csv_path)
-        dataset = [item for item in dataset if item is not None]
-        dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
-
-        model = FaceCompareModel(self.embedding_size).to(device)
-        optimizer = Adam(model.parameters(), lr=self.learning_rate)
-
+    def _train(self):
+        dataloader = self._create_dataloader()
+        model = self._create_model()
+        optimizer = Adam(model.parameters(), lr=self.params['learning_rate'])
         losses = []
-        for epoch in range(self.epochs):
+
+        for epoch in range(self.params['epochs']):
             if self.stop_training:
-                self.log_signal.emit("Training stopped by user.")
+                self.log_signal.emit("Обучение остановлено пользователем.")
                 return
-            model.train()
-            total_loss = 0
-            for i, (img1_batch, img2_batch, label_batch) in enumerate(tqdm(dataloader)):
-                optimizer.zero_grad()
-                img1_batch = img1_batch.to(device)
-                img2_batch = img2_batch.to(device)
-
-                output1 = model(img1_batch)
-                output2 = model(img2_batch)
-
-                loss = contrastive_loss(output1, output2, label_batch.to(device))
-                loss.backward()
-                optimizer.step()
-                total_loss += loss.item()
-                self.progress_signal.emit(int((i + 1) / len(dataloader) * 100))
-
-            avg_loss = total_loss / len(dataloader)
+            avg_loss = self._train_epoch(model, optimizer, dataloader)
             losses.append(avg_loss)
+            self.log_signal.emit(f"Эпоха {epoch + 1}/{self.params['epochs']}, Loss: {avg_loss:.4f}")
 
-            self.log_signal.emit(f"Epoch {epoch + 1}/{self.epochs}, Loss: {avg_loss:.4f}")
-
-        plt.figure(figsize=(10, 5))
-        plt.plot(losses)
-        plt.title('Training Loss')
-        plt.xlabel('Epochs')
-        plt.ylabel('Loss')
-        plot_path = os.path.join(self.output_dir, 'training_loss.png')
-        plt.savefig(plot_path)
+        plot_path = os.path.join(self.params['output_dir'], 'training_loss.png')
+        self._plot_losses([losses], plot_path)
         self.plot_signal.emit(plot_path)
+        save_model(model, self.params['model_path'])
+        self.log_signal.emit(f"Обучение завершено. Модель сохранена в: {self.params['model_path']}")
+        self.finished_signal.emit("Обучение завершено!")
 
-        save_model(model, self.model_path)
-        self.log_signal.emit(f"Training finished. Model saved to: {self.model_path}")
-        self.finished_signal.emit("Training completed!")
-
-    def plot_losses(self, losses, plot_path):
+    def _plot_losses(self, losses, plot_path):
         plt.figure(figsize=(10, 5))
         for i, model_losses in enumerate(losses):
-            plt.plot(model_losses, label=f"Model {i + 1}")
-        plt.title('Training Loss')
-        plt.xlabel('Epochs')
-        plt.ylabel('Loss')
+            if isinstance(model_losses[0], list):  # Handle auto-train losses
+                for j, loss in enumerate(model_losses):
+                     plt.plot(loss, label=f"Модель {j + 1} - итерация {i + 1}")
+            else:
+                plt.plot(model_losses, label=f"Модель {i + 1}")
+
+        plt.title('График потерь во время обучения')
+        plt.xlabel('Эпохи')
+        plt.ylabel('Потери')
         plt.legend()
         plt.savefig(plot_path)
 
@@ -233,101 +193,113 @@ class TrainingWorker(QThread):
 class FaceRecognitionApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Face Recognition Trainer")
+        self.setWindowTitle("Тренер распознавания лиц")
         self.setGeometry(100, 100, 800, 600)
+        self.current_config = self._load_config()
+        self._init_ui()
 
-        self.data_dir = None
-        self.output_dir = None
-        self.csv_path = None
-        self.model_path = None
-        self.current_config = {}  # Initialize with default empty dict
+    def _init_ui(self):
+        tooltips = {
+            'data_dir': "Путь к каталогу, содержащему изображения для обучения.",
+            'output_dir': "Каталог, в который будут сохранены результаты обучения (модели, графики, CSV)",
+            'model_path': "Путь к файлу, в который будет сохранена или загружена обученная модель",
+            'model_type': "Тип модели для обучения. Выберите из доступных опций.",
+            'negative_pairs': "Количество отрицательных пар, которые будут сгенерированы в CSV",
+            'epochs': "Количество эпох обучения",
+            'batch_size': "Размер пакета данных для обучения",
+            'learning_rate': "Скорость обучения",
+            'embedding_size': "Размерность векторного представления лица",
+            'resize_size': "Размер изображения для обучения",
+            'auto_train_models': "Количество моделей, которые будут обучены в режиме автоматического обучения",
+            'auto_train_iterations': "Количество итераций автоматического обучения",
+            'gpu': "Использовать GPU для обучения, если доступно"
+        }
 
-        self.load_config()
-        self.init_ui()
+        self.data_dir_label = QLabel("Каталог с данными:")
+        self.data_dir_label.setToolTip(tooltips['data_dir'])
+        self.data_dir_line = QLineEdit(self.current_config.get('data_dir', ''))
+        self.data_dir_button = QPushButton("Обзор", clicked=self._browse_data_dir)
 
-    def init_ui(self):
-        self.data_dir_label = QLabel("Data Directory:")
-        self.data_dir_line = QLineEdit()
-        self.data_dir_line.setText(self.current_config.get('data_dir', ''))
-        self.data_dir_button = QPushButton("Browse")
-        self.data_dir_button.clicked.connect(self.browse_data_dir)
+        self.output_dir_label = QLabel("Каталог вывода:")
+        self.output_dir_label.setToolTip(tooltips['output_dir'])
+        self.output_dir_line = QLineEdit(self.current_config.get('output_dir', ''))
+        self.output_dir_button = QPushButton("Обзор", clicked=self._browse_output_dir)
 
-        self.output_dir_label = QLabel("Output Directory:")
-        self.output_dir_line = QLineEdit()
-        self.output_dir_line.setText(self.current_config.get('output_dir', ''))
-        self.output_dir_button = QPushButton("Browse")
-        self.output_dir_button.clicked.connect(self.browse_output_dir)
+        self.model_path_label = QLabel("Путь к модели:")
+        self.model_path_label.setToolTip(tooltips['model_path'])
+        self.model_path_line = QLineEdit(self.current_config.get('model_path', ''))
+        self.model_path_button = QPushButton("Обзор", clicked=self._browse_model_path)
 
-        self.model_path_label = QLabel("Model Path:")
-        self.model_path_line = QLineEdit()
-        self.model_path_line.setText(self.current_config.get('model_path', ''))
-        self.model_path_button = QPushButton("Browse")
-        self.model_path_button.clicked.connect(self.browse_model_path)
+        self.model_type_label = QLabel("Тип модели:")
+        self.model_type_label.setToolTip(tooltips['model_type'])
+        self.model_type_combo = QComboBox()
+        available_models = {'FaceCompareModel': FaceCompareModel, 'CustomModel': CustomModel}
+        self.model_type_combo.addItems(list(available_models.keys()))
+        default_model = self.current_config.get('model_type', 'FaceCompareModel')
+        self.model_type_combo.setCurrentText(default_model)
+        self.available_models = available_models
 
-        self.negative_pairs_label = QLabel("Negative Pairs:")
-        self.negative_pairs_line = QLineEdit()
-        self.negative_pairs_line.setText(str(self.current_config.get('negative_pairs', 1000)))
 
-        self.epochs_label = QLabel("Epochs:")
-        self.epochs_line = QLineEdit()
-        self.epochs_line.setText(str(self.current_config.get('epochs', 10)))
+        self.negative_pairs_label = QLabel("Отрицательных пар:")
+        self.negative_pairs_label.setToolTip(tooltips['negative_pairs'])
+        self.negative_pairs_line = QLineEdit(str(self.current_config.get('negative_pairs', 1000)))
 
-        self.batch_size_label = QLabel("Batch Size:")
-        self.batch_size_line = QLineEdit()
-        self.batch_size_line.setText(str(self.current_config.get('batch_size', 32)))
+        self.epochs_label = QLabel("Эпохи:")
+        self.epochs_label.setToolTip(tooltips['epochs'])
+        self.epochs_line = QLineEdit(str(self.current_config.get('epochs', 10)))
 
-        self.learning_rate_label = QLabel("Learning Rate:")
-        self.learning_rate_line = QLineEdit()
-        self.learning_rate_line.setText(str(self.current_config.get('learning_rate', 0.001)))
+        self.batch_size_label = QLabel("Размер пакета:")
+        self.batch_size_label.setToolTip(tooltips['batch_size'])
+        self.batch_size_line = QLineEdit(str(self.current_config.get('batch_size', 32)))
 
-        self.embedding_size_label = QLabel("Embedding Size:")
-        self.embedding_size_line = QLineEdit()
-        self.embedding_size_line.setText(str(self.current_config.get('embedding_size', 128)))
+        self.learning_rate_label = QLabel("Скорость обучения:")
+        self.learning_rate_label.setToolTip(tooltips['learning_rate'])
+        self.learning_rate_line = QLineEdit(str(self.current_config.get('learning_rate', 0.001)))
 
-        self.resize_size_label = QLabel("Resize Size:")
-        self.resize_size_line = QLineEdit()
-        self.resize_size_line.setText(str(self.current_config.get('resize_size', 224)))
+        self.embedding_size_label = QLabel("Размер эмбеддинга:")
+        self.embedding_size_label.setToolTip(tooltips['embedding_size'])
+        self.embedding_size_line = QLineEdit(str(self.current_config.get('embedding_size', 128)))
 
-        self.auto_train_models_label = QLabel("Auto Train Models:")
-        self.auto_train_models_line = QLineEdit()
-        self.auto_train_models_line.setText(str(self.current_config.get('auto_train_models', 1)))
+        self.resize_size_label = QLabel("Размер изображения:")
+        self.resize_size_label.setToolTip(tooltips['resize_size'])
+        self.resize_size_line = QLineEdit(str(self.current_config.get('resize_size', 224)))
 
-        self.auto_train_iterations_label = QLabel("Auto Train Iterations:")
-        self.auto_train_iterations_line = QLineEdit()
-        self.auto_train_iterations_line.setText(str(self.current_config.get('auto_train_iterations', 1)))
 
-        self.gpu_label = QLabel("Use GPU:")
+        self.auto_train_models_label = QLabel("Количество моделей для авто-обучения:")
+        self.auto_train_models_label.setToolTip(tooltips['auto_train_models'])
+        self.auto_train_models_line = QLineEdit(str(self.current_config.get('auto_train_models', 1)))
+
+        self.auto_train_iterations_label = QLabel("Количество итераций авто-обучения:")
+        self.auto_train_iterations_label.setToolTip(tooltips['auto_train_iterations'])
+        self.auto_train_iterations_line = QLineEdit(str(self.current_config.get('auto_train_iterations', 1)))
+
+
+        self.gpu_label = QLabel("Использовать GPU:")
+        self.gpu_label.setToolTip(tooltips['gpu'])
         self.gpu_combo = QComboBox()
         self.gpu_combo.addItems(["False", "True"])
         self.gpu_combo.setCurrentText(str(self.current_config.get('use_gpu', False)))
 
-        self.generate_csv_button = QPushButton("Generate CSV")
-        self.generate_csv_button.clicked.connect(self.generate_csv)
+        self.generate_csv_button = QPushButton("Создать CSV", clicked=self._generate_csv)
+        self.train_button = QPushButton("Начать обучение", clicked=self._start_training, enabled=False)
+        self.stop_button = QPushButton("Остановить обучение", clicked=self._stop_training, enabled=False)
+        self.load_model_button = QPushButton("Загрузить модель", clicked=self._load_model_func)
 
-        self.train_button = QPushButton("Start Training")
-        self.train_button.clicked.connect(self.start_training)
-        self.train_button.setEnabled(False)
-
-        self.stop_button = QPushButton("Stop Training")
-        self.stop_button.clicked.connect(self.stop_training)
-        self.stop_button.setEnabled(False)
-
-        self.load_model_button = QPushButton("Load Model")
-        self.load_model_button.clicked.connect(self.load_model_func)
-
-        self.log_area = QTextEdit()
-        self.log_area.setReadOnly(True)
-
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setValue(0)
-
+        self.log_area = QTextEdit(readOnly=True)
+        self.progress_bar = QProgressBar(value=0)
         self.image_label = QLabel()
+        self.image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.image_label.setAlignment(Qt.AlignCenter)
 
         # Layout setup
         data_layout = QHBoxLayout()
         data_layout.addWidget(self.data_dir_label)
         data_layout.addWidget(self.data_dir_line)
         data_layout.addWidget(self.data_dir_button)
+
+        model_type_layout = QHBoxLayout()
+        model_type_layout.addWidget(self.model_type_label)
+        model_type_layout.addWidget(self.model_type_combo)
 
         output_layout = QHBoxLayout()
         output_layout.addWidget(self.output_dir_label)
@@ -383,6 +355,7 @@ class FaceRecognitionApp(QWidget):
 
         main_layout = QVBoxLayout()
         main_layout.addLayout(data_layout)
+        main_layout.addLayout(model_type_layout)
         main_layout.addLayout(output_layout)
         main_layout.addLayout(model_layout)
         main_layout.addLayout(neg_pair_layout)
@@ -398,165 +371,158 @@ class FaceRecognitionApp(QWidget):
         main_layout.addWidget(self.progress_bar)
         main_layout.addWidget(self.log_area)
         main_layout.addWidget(self.image_label)
-
         self.setLayout(main_layout)
 
-    def browse_data_dir(self):
-        dir_path = QFileDialog.getExistingDirectory(self, "Select Data Directory")
+    def _browse_data_dir(self):
+        dir_path = QFileDialog.getExistingDirectory(self, "Выберите каталог с данными")
         if dir_path:
             self.data_dir_line.setText(dir_path)
-            self.data_dir = dir_path
 
-    def browse_output_dir(self):
-        dir_path = QFileDialog.getExistingDirectory(self, "Select Output Directory")
+    def _browse_output_dir(self):
+        dir_path = QFileDialog.getExistingDirectory(self, "Выберите каталог вывода")
         if dir_path:
             self.output_dir_line.setText(dir_path)
-            self.output_dir = dir_path
 
-    def browse_model_path(self):
-        file_path, _ = QFileDialog.getSaveFileName(self, "Save Model Path", "", "PyTorch Model (*.pth)")
+    def _browse_model_path(self):
+        file_path, _ = QFileDialog.getSaveFileName(self, "Сохранить путь к модели", "", "PyTorch модель (*.pth)")
         if file_path:
             self.model_path_line.setText(file_path)
-            self.model_path = file_path
 
-    def generate_csv(self):
+    def _generate_csv(self):
         data_dir = self.data_dir_line.text()
         output_dir = self.output_dir_line.text()
-
         num_negative = self.negative_pairs_line.text()
 
         if not all([data_dir, output_dir, num_negative]):
-            QMessageBox.warning(self, "Warning", "Please fill in all directory and parameter")
+            QMessageBox.warning(self, "Предупреждение", "Пожалуйста, заполните все каталоги и параметры")
             return
 
         try:
             num_negative = int(num_negative)
         except ValueError:
-            QMessageBox.warning(self, "Error", "Invalid parameters for negative pairs")
+            QMessageBox.warning(self, "Ошибка", "Неверные параметры для отрицательных пар")
             return
 
         if not os.path.exists(os.path.join(data_dir, 'students')):
-            QMessageBox.warning(self, "Warning", "Data Directory must contain a 'students' subdirectory")
+            QMessageBox.warning(self, "Предупреждение", "Каталог с данными должен содержать подкаталог 'students'")
             return
 
-        self.log_area.append("Starting generate csv...")
-
-        self.csv_path = create_dataset_csv(data_dir, output_dir, num_negative)
-        if self.csv_path:
-            self.log_area.append(f"CSV file created: {self.csv_path}")
+        self.log_area.append("Начинаем создание csv...")
+        csv_path = create_dataset_csv(data_dir, output_dir, num_negative)
+        if csv_path:
+            self.log_area.append(f"CSV файл создан: {csv_path}")
             self.train_button.setEnabled(True)
-            self.save_config()
+            self._save_config()
+            self.csv_path = csv_path
         else:
-            self.log_area.append("Failed to create csv file!")
+            self.log_area.append("Не удалось создать csv файл!")
 
-    def start_training(self):
-        if not self.csv_path:
-            QMessageBox.warning(self, "Warning", "Please generate CSV file before starting training.")
+    def _start_training(self):
+        if not hasattr(self, 'csv_path') or not self.csv_path:
+            QMessageBox.warning(self, "Предупреждение", "Пожалуйста, создайте CSV файл перед началом обучения.")
             return
 
-        data_dir = self.data_dir_line.text()
-        output_dir = self.output_dir_line.text()
-        model_path = self.model_path_line.text()
-        epochs = self.epochs_line.text()
-        batch_size = self.batch_size_line.text()
-        learning_rate = self.learning_rate_line.text()
-        use_gpu = self.gpu_combo.currentText()
-        embedding_size = self.embedding_size_line.text()
-        resize_size = self.resize_size_line.text()
-        auto_train_models = self.auto_train_models_line.text()
-        auto_train_iterations = self.auto_train_iterations_line.text()
-
-        if not all([data_dir, output_dir, model_path, epochs, batch_size, learning_rate, embedding_size, resize_size,
-                    auto_train_models, auto_train_iterations]):
-            QMessageBox.warning(self, "Warning", "Please fill in all directory and training parameters.")
-            return
+        params = {
+            'data_dir': self.data_dir_line.text(),
+            'output_dir': self.output_dir_line.text(),
+            'model_type': self.available_models[self.model_type_combo.currentText()],
+            'model_path': self.model_path_line.text(),
+            'epochs': self.epochs_line.text(),
+            'batch_size': self.batch_size_line.text(),
+            'learning_rate': self.learning_rate_line.text(),
+            'use_gpu': self.gpu_combo.currentText(),
+            'embedding_size': self.embedding_size_line.text(),
+            'resize_size': self.resize_size_line.text(),
+            'auto_train_models': self.auto_train_models_line.text(),
+            'auto_train_iterations': self.auto_train_iterations_line.text()
+        }
 
         try:
-            epochs = int(epochs)
-            batch_size = int(batch_size)
-            learning_rate = float(learning_rate)
-            embedding_size = int(embedding_size)
-            resize_size = int(resize_size)
-            auto_train_models = int(auto_train_models)
-            auto_train_iterations = int(auto_train_iterations)
-            use_gpu = use_gpu == "True"
-        except ValueError:
-            QMessageBox.warning(self, "Error", "Invalid training parameters")
+            params['epochs'] = int(params['epochs'])
+            params['batch_size'] = int(params['batch_size'])
+            params['learning_rate'] = float(params['learning_rate'])
+            params['embedding_size'] = int(params['embedding_size'])
+            params['resize_size'] = int(params['resize_size'])
+            params['auto_train_models'] = int(params['auto_train_models'])
+            params['auto_train_iterations'] = int(params['auto_train_iterations'])
+            params['use_gpu'] = params['use_gpu'] == "True"
+
+        except ValueError as e:
+            QMessageBox.warning(self, "Ошибка", f"Неверные параметры обучения: {e}")
             return
 
-        self.log_area.append("Starting training...")
+        self.log_area.append("Начинаем обучение...")
         self.progress_bar.setValue(0)
         self.train_button.setEnabled(False)
         self.stop_button.setEnabled(True)
 
-        self.training_worker = TrainingWorker(
-            data_dir=data_dir,
-            output_dir=output_dir,
-            csv_path=self.csv_path,
-            epochs=epochs,
-            batch_size=batch_size,
-            learning_rate=learning_rate,
-            use_gpu=use_gpu,
-            model_path=model_path,
-            embedding_size=embedding_size,
-            resize_size=resize_size,
-            auto_train_models=auto_train_models,
-            auto_train_iterations=auto_train_iterations
-        )
-        self.training_worker.progress_signal.connect(self.update_progress)
-        self.training_worker.log_signal.connect(self.update_log)
-        self.training_worker.plot_signal.connect(self.display_plot)
-        self.training_worker.finished_signal.connect(self.training_finished)
+        self.training_worker = TrainingWorker(params=params, csv_path=self.csv_path)
+        self.training_worker.progress_signal.connect(self._update_progress)
+        self.training_worker.log_signal.connect(self._update_log)
+        self.training_worker.plot_signal.connect(self._display_plot)
+        self.training_worker.finished_signal.connect(self._training_finished)
         self.training_worker.start()
-        self.save_config()
+        self._save_config()
 
-    def stop_training(self):
+    def _stop_training(self):
         if hasattr(self, 'training_worker') and self.training_worker.isRunning():
             self.training_worker.stop()
-            self.log_area.append("Stopping training...")
+            self.log_area.append("Останавливаем обучение...")
             self.stop_button.setEnabled(False)
 
-    def load_model_func(self):
+    def _load_model_func(self):
         model_path = self.model_path_line.text()
         embedding_size = self.embedding_size_line.text()
         if not all([model_path, embedding_size]):
-            QMessageBox.warning(self, "Warning", "Please specify the Model Path and Embedding Size before loading.")
+            QMessageBox.warning(self, "Предупреждение",
+                                "Пожалуйста, укажите путь к модели и размер эмбеддинга перед загрузкой.")
             return
         try:
             embedding_size = int(embedding_size)
         except ValueError:
-            QMessageBox.warning(self, "Error", "Invalid Embedding size")
+            QMessageBox.warning(self, "Ошибка", "Неверный размер эмбеддинга")
             return
 
         try:
-            model = load_model(model_path, embedding_size)
-            self.log_area.append(f"Model loaded from {model_path}")
+            load_model(model_path, embedding_size)
+            self.log_area.append(f"Модель загружена из {model_path}")
         except Exception as e:
-            self.log_area.append(f"Error loading model: {e}")
-            return
+            self.log_area.append(f"Ошибка загрузки модели: {e}")
 
-    def update_progress(self, value):
+    def _update_progress(self, value):
         self.progress_bar.setValue(value)
 
-    def update_log(self, message):
+    def _update_log(self, message):
         self.log_area.append(message)
 
-    def display_plot(self, plot_path):
+    def _display_plot(self, plot_path):
         try:
-            plt.figure()
-            img = plt.imread(plot_path)
-            plt.imshow(img)
-            plt.axis('off')
-            plt.show(block=False)
+            pixmap = self._load_plot_pixmap(plot_path)
+            self.image_label.setPixmap(pixmap)
+            self.image_label.setAlignment(Qt.AlignCenter)
+            self.image_label.show()
         except Exception as e:
-            self.log_area.append(f"Error displaying plot: {e}")
+            self.log_area.append(f"Ошибка отображения графика: {e}")
 
-    def training_finished(self, message):
+
+    def _load_plot_pixmap(self, plot_path):
+        try:
+            img_data = plt.imread(plot_path)
+            height, width, channel = img_data.shape
+            bytes_per_line = channel * width
+            q_img = QImage(img_data.data, width, height, bytes_per_line, QImage.Format_RGB888)
+            return QPixmap.fromImage(q_img)
+        except Exception as e:
+            self.log_area.append(f"Ошибка преобразования графика в QPixmap: {e}")
+            return QPixmap()
+
+
+    def _training_finished(self, message):
         self.log_area.append(message)
         self.train_button.setEnabled(True)
         self.stop_button.setEnabled(False)
 
-    def save_config(self):
+    def _save_config(self):
         config = {
             'data_dir': self.data_dir_line.text(),
             'output_dir': self.output_dir_line.text(),
@@ -569,20 +535,25 @@ class FaceRecognitionApp(QWidget):
             'embedding_size': self.embedding_size_line.text(),
             'resize_size': self.resize_size_line.text(),
             'auto_train_models': self.auto_train_models_line.text(),
-            'auto_train_iterations': self.auto_train_iterations_line.text()
+            'auto_train_iterations': self.auto_train_iterations_line.text(),
+             'model_type': self.model_type_combo.currentText()
         }
-
         with open('src/config.json', 'w') as f:
             json.dump(config, f)
         self.current_config = config
 
-    def load_config(self):
+    def _load_config(self):
         try:
             with open('src/config.json', 'r') as f:
-                self.current_config = json.load(f)
+                config = json.load(f)
+                if 'model_type' in config:
+                    return config
+                return {}
         except FileNotFoundError:
-            self.current_config = {}
+            return {}
+
 
     def closeEvent(self, event):
-        self.save_config()
+        self._save_config()
         event.accept()
+

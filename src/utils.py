@@ -1,3 +1,4 @@
+
 import os
 import random
 import pandas as pd
@@ -62,8 +63,8 @@ def create_negative_pairs(data_dir, num_negative, positive_pairs):
 
 def create_dataset_csv(data_dir, output_dir, num_negative):
     """Создает CSV файл с парами изображений и метками."""
-    positive_pairs, positive_labels = create_pairs(os.path.join(data_dir, 'students'))
-    negative_pairs, negative_labels = create_negative_pairs(os.path.join(data_dir, 'students'),
+    positive_pairs, positive_labels = create_pairs(data_dir)
+    negative_pairs, negative_labels = create_negative_pairs(data_dir,
                                                             num_negative, positive_pairs)
 
     all_pairs = positive_pairs + negative_pairs
@@ -104,6 +105,27 @@ class FaceCompareModel(nn.Module):
         embedding = self.efficientnet(x)
         return embedding
 
+class CustomModel(nn.Module):
+     def __init__(self, embedding_size=128):
+        super(CustomModel, self).__init__()
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=5, padding=2)
+        self.pool1 = nn.MaxPool2d(2, 2)
+        self.conv2 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+        self.pool2 = nn.MaxPool2d(2, 2)
+        self.fc1 = nn.Linear(128 * 56 * 56, 512)
+        self.fc2 = nn.Linear(512, embedding_size)
+        self.relu = nn.ReLU()
+
+     def forward(self, x):
+        x = self.relu(self.conv1(x))
+        x = self.pool1(x)
+        x = self.relu(self.conv2(x))
+        x = self.pool2(x)
+        x = x.view(x.size(0), -1)
+        x = self.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
 
 def contrastive_loss(output1, output2, label, margin=1.0):
     euclidean_distance = torch.nn.functional.pairwise_distance(output1, output2)
@@ -125,3 +147,11 @@ def load_model(model_path, embedding_size=128):
 
 def copy_model(model):
     return deepcopy(model)
+
+def import_model(model_name, embedding_size):
+    if model_name == "FaceCompareModel":
+        return FaceCompareModel(embedding_size)
+    elif model_name == "CustomModel":
+        return CustomModel(embedding_size)
+    else:
+        raise ValueError(f"Неизвестное имя модели: {model_name}")
